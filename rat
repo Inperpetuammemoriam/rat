@@ -1,0 +1,194 @@
+#!/bin/bash
+#
+#    rat: REST API Tester
+#    Copyright (C) 2021-2022  Inperpetuammemoriam
+#
+#    This program is free software: you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation, either version 3 of the License, or
+#    (at your option) any later version.
+#
+#    This program is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License
+#    along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+function check_status {
+	if [[ "$verbosity" =~ "v" ]]
+	then
+		echo -n "Status: "
+	fi
+	if [ "$(jq -r ".http_code" <<< "$metadata")" -ne "$(jq -r ".status // 200" "$i/$j")" ]
+	then
+		if [[ "$verbosity" =~ "v" ]]
+		then
+			echo -e "\e[31m$(jq -r ".http_code" <<< "$metadata")\e[0m\e[32m$(jq -r ".status // 200" "$i/$j")\e[0m"
+		fi
+		return 1
+	fi
+	if [[ "$verbosity" =~ "v" ]]
+	then
+		jq -r ".http_code" <<< "$metadata"
+	fi
+	return 0
+}
+
+function check_output_raw {
+	if [ "$data" != "$(jq -cr ".output.raw" "$i/$j")" ]
+	then
+		return 1
+	fi
+	return 0
+}
+
+function check_output_regex {
+	if [[ "$data" =~ "$(jq -r ".output.regex" "$i/$j")" ]]
+	then
+		return 1
+	fi
+	return 0
+}
+
+declare -a tests
+while getopts ":b:ht:v" opt
+do
+	case $opt in
+		b) base_url="$OPTARG" ;;
+		t) tests+=("$OPTARG") ;;
+		h)
+			cat << EOF
+Usage: ${0##*/} [options]
+Test bench for REST APIs.
+
+Options:
+! -b BASEURL  Provides the base URL of the API.
+  -t FILE     Specifies where to search for the test cases.
+  -v          Increases the verbosity.
+  -h          Prints this help page.
+EOF
+			exit 0
+			;;
+		v) verbosity="v$verbosity" ;;
+		:)
+			case $OPTARG in
+				*)
+					echo "Error: Option \"-$OPTARG\" requires an argument." >&2
+					exit 1
+					;;
+			esac
+			;;
+		\?)
+			echo "Error: Invalid option \"-$OPTARG\"." >&2
+			exit 1
+			;;
+	esac
+done
+if [ -z "${base_url+x}" ]
+then
+	echo "Error: Missing mandatory option \"-b\"." >&2
+	exit 1
+fi
+if [ -z "$base_url" ]
+then
+	echo "Error: Argument of option \"-b\" must not be empty." >&2
+	exit 1
+fi
+
+IFS=$'\n'
+for i in ${tests[@]}
+do
+	if [ -d "$i" ]
+	then
+		for j in $(cd $i && find -name "*.json" -printf "%P\n" | sort)
+		do
+			if jq -e . "$i/$j" > /dev/null 2> /dev/null
+			then
+				method=$(jq -r ".method // \"GET\"" "$i/$j")
+				path=$(jq -r ".path // \"\"" "$i/$j")
+				query=$(jq -r "select(has(\"query\")) | .query | [ to_entries[] | join(\"=\") ] | join(\"&\")" "$i/$j")
+				declare -a headers
+				headers=$(jq -r "[ select(has(\"headers\")) | .headers | to_entries[] | \"\(join(\":\"))\" | \"-H\n\(.)\" ] | join(\"\n\") // \"\"" "$i/$j")
+				output=$(mktemp -p /tmp http.XXXXXXXXXX)
+				if [[ "$j" =~ "/" ]]
+				then
+					url="$base_url/${j%/*}$(if [ -n "$path" ];then echo -n "/";fi)$path$(if [ -n "$query" ];then echo -n "?";fi)$query"
+				else
+					url="$base_url/${i%/}$(if [ -n "$path" ];then echo -n "/";fi)$path$(if [ -n "$query" ];then echo -n "?";fi)$query"
+				fi
+				if [ -n "$(jq -r ".input // \"\"" "$i/$j")" ]
+				then
+					metadata=$(curl -so "$output" -X "$method" ${headers[@]} -w "{\"content_type\":\"%{content_type}\",\"http_code\":%{http_code}}" "$url" -H "Content-Type: application/json" -d "$(jq -cr ".input" "$i/$j")")
+				else
+					metadata=$(curl -so "$output" -X "$method" ${headers[@]} -w "{\"content_type\":\"%{content_type}\",\"http_code\":%{http_code}}" "$url")
+				fi
+				echo -e "\e[1m$i/$j:\e[0m"
+				if [ $? -ne 0 ]
+				then
+					rm "$output"
+					continue
+				fi
+				declare -A results
+				check_status
+				results[check_status]=$?
+				if [ -n "$(jq -r ".input // \"\"" "$i/$j")" ]
+				then
+					if [[ "$verbosity" =~ "v" ]]
+					then
+						echo -n "Input: "
+						jq -cr ".input // \"\"" "$i/$j"
+					fi
+				fi
+				if [ -s "$output" ]
+				then
+					if [[ "$verbosity" =~ "v" ]]
+					then
+						echo -n "Output: "
+					fi
+					if [ "$(jq -r ".content_type" <<< "$metadata")" == "application/json" ]
+					then
+						data=$(jq -cr . "$output")
+						if [[ "$verbosity" =~ "v" ]]
+						then
+							jq -cr . "$output"
+						fi
+					else
+						data=$(cat "$output")
+						if [[ "$verbosity" =~ "v" ]]
+						then
+							cat "$output"
+						fi
+					fi
+					if [ -n "$(jq -r ".output.raw // \"\"" "$i/$j")" ]
+					then
+						check_output_raw
+						results[check_output_raw]=$?
+					fi
+					if [ -n "$(jq -r ".output.regex // \"\"" "$i/$j")" ]
+					then
+						check_output_regex
+						results[check_output_regex]=$?
+					fi
+				fi
+				if [[ "$verbosity" =~ "v" ]]
+				then
+					echo
+				fi
+				for k in ${!results[@]}
+				do
+					echo -en "$k:\t"
+					if [ ${results[$k]} -eq 0 ]
+					then
+						echo -e "\e[1m\e[32mSUCCESS\e[0m"
+					else
+						echo -e "\e[1m\e[31mFAILURE\e[0m"
+					fi
+				done | column -ts $'\t'
+				unset results
+				rm "$output"
+			fi
+		done
+	fi
+done
